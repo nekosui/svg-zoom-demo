@@ -1,4 +1,4 @@
-import { defineComponent, ref } from "vue";
+import { computed, defineComponent, onMounted, ref } from "vue";
 
 import './index.styl'
 
@@ -32,16 +32,25 @@ const getMiddlePoint = (p1: Point | Rect, p2: Point | Rect): Point => ({
   y: (p1.y + p2.y) / 2
 })
 
-const getPositionInSvg = (svg: SVGGraphicsElement, e: MouseEvent | Touch): DOMPoint => {
+const getClientPoint = (e: MouseEvent | Touch): Point => ({
+  x: e.clientX,
+  y: e.clientY,
+})
+
+/** client坐标转成svg内坐标 */
+const getPositionInSvg = (svg: SVGGraphicsElement, e: MouseEvent | Touch | Point): DOMPoint => {
   let x = 0
   let y = 0
 
   if (e instanceof MouseEvent) {
     x = e.clientX
     y = e.clientY
-  } else { // e instanceof Touch
+  } else if (e instanceof Touch) {
     x = e.clientX
     y = e.clientY
+  } else {
+    x = e.x
+    y = e.y
   }
 
   const domPoint = new DOMPoint(x, y)
@@ -49,23 +58,56 @@ const getPositionInSvg = (svg: SVGGraphicsElement, e: MouseEvent | Touch): DOMPo
   return pointInSvg
 }
 
+const getInitialViewBox = function(slide: 'width' | 'height', size: number = 100) {
+  const svgRef = ref<SVGGraphicsElement>()
+  const viewBox = ref<Rect>({ x: 0, y: 0, width: 100, height: 100 })
+  const viewBoxText = computed(() => [
+    viewBox.value.x,
+    viewBox.value.y,
+    viewBox.value.width,
+    viewBox.value.height
+  ].join(' '))
+
+  onMounted(() => {
+    if (!svgRef.value) {
+      return
+    }
+
+    if (slide === 'width') {
+      const vh = svgRef.value.clientHeight / svgRef.value.clientWidth * size
+      viewBox.value = {x: 0, y: 0, width: size, height: vh}
+    } else { // slide === 'height'
+      const vw = svgRef.value.clientWidth / svgRef.value.clientHeight * size
+      viewBox.value = {x: 0, y: 0, width: vw, height: size}
+    }
+  })
+
+  return { svgRef, viewBox, viewBoxText }
+}
+
 const HallMap = defineComponent({
   setup() {
-    const svgRef = ref<SVGGraphicsElement>()
+    const moving = ref(false)
+    const { svgRef, viewBox, viewBoxText } = getInitialViewBox('height', 300)
     let touchStartDistance = 0
-    const viewBoxText = ref('0 0 100 160')
-
-    /** 按下时的viewBox数据 */
-    let touchStartViewBox: Rect = { x: 0, y: 0, width: 100, height: 160 }
-    let virtualNewViewBox = ref<Rect>({ x: 0, y: 0, width: 0, height: 0 })
+    /** 按下时的viewBox */
+    let touchStartViewBox = {...viewBox.value}
     /** 按下时的中点坐标 (client) */
-    let touchStartMiddlePoint: Point = { x: 0, y: 0 }
+    let startPoint: Point = { x: 0, y: 0 }
     /** 按下时的中点坐标 (svg画布内的) */
     let touchStartMiddlePointInSVG: Point = { x: 0, y: 0 }
-    /** 拖动前，视窗的中心点坐标 */
-    let middlePointInSVG: Point = { x: 0, y: 0 }
-    let touchEndMiddlePointInSVGRef = ref<Point>({ x: 0, y: 0 })
-    let clientPoint = ref<Point[]>([])
+    /** viewBox宽高和svg元素宽高的比值 */
+    let ratio = { w: 1, h: 1 }
+    /** 按下时的viewBox的xy与按下时的中点的xy的差 */
+    let diffBetweenViewBoxAndTouchPoint: Point = { x: 0, y: 0 }
+
+    const getViewBoxRatio = () => {
+      if (!svgRef.value) return
+      ratio = {
+        w: svgRef.value.clientWidth / viewBox.value.width,
+        h: svgRef.value.clientHeight / viewBox.value.height
+      }
+    }
 
     const onTouchStart = function(e: TouchEvent) {
       e.stopPropagation()
@@ -78,144 +120,70 @@ const HallMap = defineComponent({
       const clientP1: Point = { x: e.touches[0].clientX, y: e.touches[0].clientY }
       const clientP2: Point = { x: e.touches[1].clientX, y: e.touches[1].clientY }
 
-      touchStartMiddlePoint = getMiddlePoint(clientP1, clientP2)
+      startPoint = getMiddlePoint(clientP1, clientP2)
+      touchStartMiddlePointInSVG = getPositionInSvg(svgRef.value, startPoint)
       touchStartDistance = getPointDistance(clientP1, clientP2)
-
-      clientPoint.value = [touchStartMiddlePoint]
-
-      const svgP1 = getPositionInSvg(svgRef.value, e.touches[0])
-      const svgP2 = getPositionInSvg(svgRef.value, e.touches[1])
-      touchStartMiddlePointInSVG = getMiddlePoint(svgP1, svgP2)
-
-      middlePointInSVG = {
-        x: touchStartViewBox.x + touchStartViewBox.width / 2,
-        y: touchStartViewBox.y + touchStartViewBox.height / 2,
+      touchStartViewBox = {...viewBox.value}
+      diffBetweenViewBoxAndTouchPoint = {
+        x: touchStartMiddlePointInSVG.x - touchStartViewBox.x,
+        y: touchStartMiddlePointInSVG.y - touchStartViewBox.y,
       }
+
+      moving.value = true
     }
-
     const onTouchMove = function(e: TouchEvent) {
-      e.stopPropagation()
-      e.preventDefault()
+      if (!svgRef.value) return
+      if (!moving.value) return
 
-      if (!svgRef.value || e.touches.length === 1) {
-        return
-      }
-
-      const clientP1: Point = { x: e.touches[0].clientX, y: e.touches[0].clientY }
-      const clientP2: Point = { x: e.touches[1].clientX, y: e.touches[1].clientY }
-
-      /** 两指中点的坐标，在client内的位置 */
-      const touchEndMiddlePoint = getMiddlePoint(clientP1, clientP2)
+      const clientP1: Point = getClientPoint(e.touches[0])
+      const clientP2: Point = getClientPoint(e.touches[1])
+      const currentPoint = getMiddlePoint(clientP1, clientP2)
       const touchEndDistance = getPointDistance(clientP1, clientP2)
 
-      if (clientPoint.value.length === 1) {
-        clientPoint.value.push(touchEndMiddlePoint)
-      } else {
-        clientPoint.value.splice(1, 1, touchEndMiddlePoint)
-      }
-
       /** 缩放倍率 */
-      const scale = touchEndDistance / touchStartDistance
+      const scale = touchStartDistance / touchEndDistance
 
-      /** 新视窗 */
-      const newViewBox = {
-        x: 0,
-        y: 0,
-        width: touchStartViewBox.width / scale,
-        height: touchStartViewBox.height / scale
+      const clientVector = {
+        x: currentPoint.x - startPoint.x,
+        y: currentPoint.y - startPoint.y,
       }
 
-      /** 计算两指中点在client内的的移动向量（往哪里移，移动了多少） */
-      const touchEndMiddlePointVector = {
-        x: touchStartMiddlePoint.x - touchEndMiddlePoint.x,
-        y: touchStartMiddlePoint.y - touchEndMiddlePoint.y,
-        // x: touchEndMiddlePoint.x - touchStartMiddlePoint.x,
-        // y: touchEndMiddlePoint.y - touchStartMiddlePoint.y,
+      const svgVector = {
+        x: clientVector.x / ratio.w,
+        y: clientVector.y / ratio.h,
       }
 
-      /** 两指中点的坐标，在拖动改变viewBox前的svg内的位置 */
-      const touchEndMiddlePointInSVG = {
-        x : touchStartMiddlePointInSVG.x + touchEndMiddlePointVector.x / svgRef.value.clientWidth * touchStartViewBox.width,
-        y : touchStartMiddlePointInSVG.y + touchEndMiddlePointVector.y / svgRef.value.clientHeight * touchStartViewBox.height,
+      viewBox.value = {
+        x: touchStartMiddlePointInSVG.x - (diffBetweenViewBoxAndTouchPoint.x + svgVector.x) * scale,
+        y: touchStartMiddlePointInSVG.y - (diffBetweenViewBoxAndTouchPoint.y + svgVector.y) * scale,
+        width: touchStartViewBox.width * scale,
+        height: touchStartViewBox.height * scale,
       }
-
-      touchEndMiddlePointInSVGRef.value = touchEndMiddlePointInSVG
-
-      const originWidth = touchStartMiddlePointInSVG.x - touchStartViewBox.x
-      const originHeight = touchStartMiddlePointInSVG.y - touchStartViewBox.y
-
-      newViewBox.x = touchEndMiddlePointInSVG.x - originWidth / scale
-      newViewBox.y = touchEndMiddlePointInSVG.y - originHeight / scale
-
-      // virtualNewViewBox.value = newViewBox
-
-      viewBoxText.value = [
-        newViewBox.x,
-        newViewBox.y,
-        newViewBox.width,
-        newViewBox.height
-      ].join(' ')
     }
-
-    const onTouchEnd = function(e: TouchEvent) {
-      e.stopPropagation()
-      e.preventDefault()
-
-      const arr = viewBoxText.value.split(' ')
-      touchStartViewBox = {
-        x: +arr[0],
-        y: +arr[1],
-        width: +arr[2],
-        height: +arr[3]
-      }
-
-      clientPoint.value = []
+    const onTouchEnd = () => {
+      moving.value = false
+      if (!svgRef.value) return
+      getViewBoxRatio()
     }
 
     return () => (
-      <div class="bg-body-tertiary">
+      <div class="bg-body-tertiary" style="display:flex;align-items:center;justify-content:center;height:100%">
         <svg
+          style="border:solid 1px #000;margin:auto;"
           ref={svgRef}
           viewBox={viewBoxText.value}
           class="bg-body-tertiary"
+          width="80%"
+          height="80%"
           onTouchstart={onTouchStart}
           onTouchmove={onTouchMove}
           onTouchend={onTouchEnd}
         >
-          <rect x="20" y="20" width={30} height={30} fill="#000" />
-          <rect x="50" y="20" width={30} height={30} fill="#f00" />
-          <rect x="20" y="50" width={30} height={30} fill="#0f0" />
-          <rect x="50" y="50" width={30} height={30} fill="#00f" />
-          <circle
-            cx={touchEndMiddlePointInSVGRef.value.x}
-            cy={touchEndMiddlePointInSVGRef.value.y}
-            r={1}
-            fill="#000"
-          />
-          <rect
-            x={virtualNewViewBox.value.x}
-            y={virtualNewViewBox.value.y}
-            width={virtualNewViewBox.value.width}
-            height={virtualNewViewBox.value.height}
-            fill="transparent"
-            stroke="#f00"
-            stroke-width={1}
-          />
+          <rect x="7" y="20" width={30} height={30} fill="#000" />
+          <rect x="37" y="20" width={30} height={30} fill="#f00" />
+          <rect x="7" y="50" width={30} height={30} fill="#0f0" />
+          <rect x="37" y="50" width={30} height={30} fill="#00f" />
         </svg>
-        {
-          clientPoint.value.map(p => (
-            <div style={{
-              position: 'absolute',
-              zIndex: 4,
-              left: p.x + 'px',
-              top: p.y + 'px',
-              width: '10px',
-              height: '10px',
-              backgroundColor: '#ff0',
-              borderRadius: '50%'
-            }}/>
-          ))
-        }
       </div>
     )
   }
